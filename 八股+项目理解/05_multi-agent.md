@@ -157,7 +157,99 @@ def _create_agent(self):
     )
 ```
 
+## sub-agent如何共享上下文
+子 Agent 不直接继承主 Agent 的完整聊天历史。它只拿到主 Agent 通过 prompt 参数交给它的任务描述。
 
+```python
+sandbox_state = runtime.state.get("sandbox")
+thread_data = runtime.state.get("thread_data")
+thread_id = runtime.context.get("thread_id")
+parent_model = runtime.config["metadata"]["model_name"]
+```
+
+会构造初始state，
+```python
+state = {"messages": [HumanMessage(content=task)]}
+
+如果有 sandbox/thread 数据，也塞进去：
+state["sandbox"] = self.sandbox_state
+state["thread_data"] = self.thread_data
+```
+
+所以通信边界是，
+
+```text
+主 Agent -> 子 Agent：一段 prompt + 共享 sandbox/thread 环境
+子 Agent -> 主 Agent：最终 result 字符串
+```
+
+## sub-agent 如何运行
+SubagentExecutor.execute_async() 会把任务放到后台线程池
+线程池有三个：
+```python
+
+_scheduler_pool = ThreadPoolExecutor(max_workers=3)
+_execution_pool = ThreadPoolExecutor(max_workers=3)
+_isolated_loop_pool = ThreadPoolExecutor(max_workers=3)
+
+execute_async()
+  -> 创建 SubagentResult，状态 PENDING
+  -> 放入全局 _background_tasks
+  -> 提交 run_task 到 _scheduler_pool
+  -> run_task 再提交 self.execute 到 _execution_pool
+  -> self.execute 内部用 asyncio.run 或独立 event loop 跑 _aexecute()
+
+真正执行时：
+async for chunk in agent.astream(
+    state,
+    config=run_config,
+    context=context,
+    stream_mode="values",
+):
+
+if isinstance(last_message, AIMessage):
+    result.ai_messages.append(message_dict)
+
+
+最终从 final_state["messages"] 里找最后一个 AIMessage，作为：
+result.result
+
+```
+
+## 如何返还
+主 Agent 调用 task 工具后，task_tool 会一直轮询后台任务：
+
+```python
+while True:
+    result = get_background_task_result(task_id)
+    ...
+    if result.status == SubagentStatus.COMPLETED:
+        return f"Task Succeeded. Result: {result.result}"
+
+子 Agent 的最终结果会变成 task 工具的返回值。LangGraph 会把这个返回值包装成 ToolMessage，回到主 Agent 的消息历史中：
+
+AIMessage: 调用 task(...)
+ToolMessage: Task Succeeded. Result: ...
+AIMessage: 主 Agent 综合子 Agent 结果回答用户
+
+```
+
+```text
+主 Agent system prompt 告诉模型可用 subagent 策略
+  -> get_available_tools(subagent_enabled=True) 暴露 task 工具
+  -> 模型判断任务复杂，输出 task tool_call
+  -> LangGraph 执行 task_tool
+  -> task_tool 根据 subagent_type 找 SubagentConfig
+  -> 创建 SubagentExecutor
+  -> Executor 过滤工具，创建子 create_agent()
+  -> 子 Agent 在后台线程/事件循环里 astream 执行
+  -> 子 Agent 用自己的 system_prompt + 工具完成任务
+  -> Executor 提取最后一个 AIMessage 作为 result
+  -> task_tool 轮询到 completed
+  -> 返回 "Task Succeeded. Result: ..."
+  -> 主 Agent 收到 ToolMessage
+  -> 主 Agent 综合结果回答用户
+```
 
 
 

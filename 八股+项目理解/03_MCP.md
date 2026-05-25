@@ -133,6 +133,7 @@ Streamable HTTP并不是抛弃SSE，而是把双端点合并成一个/mcp。Clie
 工具层：client.get_tools() -> list[BaseTool]
 Agent 层：get_available_tools -> create_agent -> ToolNode + tool_search
 ```
+
 流程：
 ```text
 
@@ -296,8 +297,6 @@ MCP server 返回结果
 结果包装成 ToolMessage 回给模型
 
 ```
-
-
 
 
 ## 缓存的一个细节
