@@ -84,11 +84,10 @@ while (api_call_count < agent.max_iterations      # ← 最多 90 轮
 | 灵活性 | 直接改源码的 while 循环 | 插拔式中间件，但受框架约束 |
 
 
-langchain1底层是一个编译好的状态图:
-agent (LLM) → tools (conditional) → agent → END
-
+**langchain**底层是一个编译好的状态图:
+```agent (LLM) → tools (conditional) → agent → END```
 hermes:
-while 循环 { call_llm() → if tool_calls: execute() → append → continue else: return }
+```while 循环 { call_llm() → if tool_calls: execute() → append → continue else: return }```
 
 ## Hermes 拒绝框架的深层原因
 
