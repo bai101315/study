@@ -2,8 +2,86 @@
 
 答案:
 ```
-我项目里的 sandbox 是 Agent Runtime 的受控执行层。它通过 Sandbox 抽象统一了命令执行和文件操作，通过 SandboxProvider 管理实例。当前实现是 LocalSandbox，Agent 看到的是 /mnt/user-data/... 这样的虚拟路径，底层会映射到每个 thread 独立的本地工作目录。工具层把它封装成 bash/read_file/write_file/grep/glob 等 LangChain tools。执行命令时会经过 bash 审计、路径校验、虚拟路径替换、工作目录绑定、输出脱敏和长度截断。需要强调的是，当前 LocalSandbox 是本地受控执行环境，不是强隔离安全容器；真正生产环境可以替换 Provider 为 Docker/VM 沙箱。
+我项目里的 sandbox 是 Agent Runtime 的受控执行层。它通过 
+
+Sandbox 抽象统一了命令执行和文件操作，
+
+通过 SandboxProvider 管理实例。当前实现是 LocalSandbox，Agent 看到的是 /mnt/user-data/... 这样的虚拟路径，底层会映射到每个 thread 独立的本地工作目录。
+
+工具层把它封装成 bash/read_file/write_file/grep/glob 等 LangChain tools。执行命令时会经过 bash 审计、路径校验、虚拟路径替换、工作目录绑定、输出脱敏和长度截断。需要强调的是，
+
+当前 LocalSandbox 是本地受控执行环境，不是强隔离安全容器；真正生产环境可以替换 Provider 为 Docker/VM 沙箱。
 ```
+
+# 心智模型
+agent 本身，也就是 LLM，并不能直接读硬盘。只能调用工具：
+```
+ls
+read_file
+write_file
+str_replace
+bash
+grep
+glob
+```
+调用工具的时候，才会检查路径是否合法：
+```
+你要读哪里？
+你要写哪里？
+这个路径是不是允许的虚拟路径？
+能不能映射到当前 thread 的真实目录？
+是不是 read-only？
+```
+
+# 三个文件夹从哪里来
+三个核心目录不是 sandbox provider 创建的，而是 ThreadDataMiddleware 管的。
+
+它为每个 thread_id 准备三个目录：
+```
+{base_dir}/threads/{thread_id}/user-data/workspace
+{base_dir}/threads/{thread_id}/user-data/uploads
+{base_dir}/threads/{thread_id}/user-data/outputs
+
+存储在 state 中的thread_data中， 
+```
+
+所以每个会话线程都有自己独立的一组三目录。在LLM视角下是：
+```
+/mnt/user-data/workspace
+/mnt/user-data/uploads
+/mnt/user-data/outputs
+```
+
+# sandbox 是谁创建的
+
+创建入口有两个：
+1. SandboxMiddleware
+lazy_init=True: 不是 agent 一启动就马上创建 sandbox, 而是等第一次工具调用时才创建
+
+但现在项目里 _build_runtime_middlewares(lazy_init=True)，所以通常是首次工具调用时创建。
+
+2. ensure_sandbox_initialized(runtime)
+
+```
+如果 runtime.state["sandbox"] 已经有 sandbox_id
+  直接 get 这个 sandbox
+
+否则：
+  从 runtime/context/config 里拿 thread_id
+  调 provider.acquire(thread_id)
+  把 {"sandbox_id": sandbox_id} 写回 runtime.state["sandbox"]
+  返回 sandbox 实例
+```
+
+```
+provider = get_sandbox_provider()
+sandbox_id = provider.acquire(thread_id)
+runtime.state["sandbox"] = {"sandbox_id": sandbox_id}
+sandbox = provider.get(sandbox_id)
+```
+
+
+
 
 详细介绍:
 ```
@@ -62,11 +140,14 @@ LLM 决定调用工具
 ```text
 execute_command()
 read_file()
-list_dir()
 write_file()
+update_file()
+list_dir()
 glob()
 grep()
-update_file()
+
+glob(): 匹配文件名 / 目录路径, 
+grep(): 匹配文件内部的文本内容
 ```
 
 所以这里的设计思路是：
@@ -91,9 +172,12 @@ get_sandbox_provider()
 ```
 
 
-
-
 ## 3.当前实现：LocalSandboxProvider
+
+做了两件事：
+1. 设置路径映射
+2. 返回一个 singleton 的 LocalSandbox("local")
+
 把 sandbox 能力包装成 LangChain tools
 
 ```python
@@ -124,11 +208,64 @@ sandbox_id 固定是 "local"
 隔离主要靠路径规则，不靠 OS 容器隔离
 ```
 
-路径映射在 _setup_path_mappings() 里做，比如：
+###  路径映射
+LocalSandboxProvider 会建立一些 container path 到 host path 的映射。
+```python
+PathMapping(
+    container_path=config.skills.container_path,
+    local_path=str(skills_path),
+    read_only=True,
+)
+
+# 在配置中类似：
+skills:
+  path: C:/Users/BAI/Desktop/project/skills
+  container_path: ../skills
+
+默认情况下：
+/mnt/skills  →  C:/Users/BAI/Desktop/project/skills
+
 ```
-/mnt/skills -> 本地 skills 目录，只读
-自定义 mounts -> config.yaml 里的 sandbox.mounts
+
+它还支持 config.yaml 里的 custom mounts：
 ```
+sandbox:
+  mounts:
+    - host_path: ...
+      container_path: ...
+      read_only: true/false
+```
+
+所以 agent 可访问的不止三目录，完整允许族大概是:
+```
+/mnt/user-data/*
+skills container path，只读
+config.yaml 里配置的 custom mounts
+```
+
+## 真正限制路径的核心代码
+
+```python
+validate_local_tool_path(path, thread_data, read_only=False)
+
+/mnt/user-data/*              读写
+/mnt/skills/*                 只读
+custom mount paths            按配置 read_only 决定
+
+必须用虚拟路径：
+/mnt/user-data/uploads/prime.py
+/mnt/user-data/workspace/foo.py
+/mnt/user-data/outputs/result.md
+```
+
+不在这些范围就报错：
+```
+raise PermissionError(
+    "Only paths under /mnt/user-data/, /mnt/skills/, /mnt/acp-workspace/, or configured mount paths are allowed"
+)
+```
+
+
 
 ## 4. LocalSandbox：真正执行命令和文件操作
 它做两件核心事情：
@@ -140,7 +277,18 @@ def _resolve_path(self, path: str) -> str:
             relative = path_str[len(mapping.container_path):].lstrip("/")
             return str(Path(mapping.local_path) / relative)
     return path_str
+
+它会根据 thread_data 把虚拟路径映射到真实宿主机路径，比如：
+/mnt/user-data/uploads/prime.py  ->   C:/Users/BAI/Desktop/project/.deer_flow/threads/<thread_id>/user-data/uploads/prime.py
+然后调用sandbox.read_file(path)
+
+LocalSandbox 里再执行真实文件读取。
+
+读完后，如果输出里出现宿主机路径，系统会尽量把它反向替换回虚拟路径，避免把真实 host path 暴露给 LLM。
+
 ```
+
+
 2. 执行命令。
 ```python
 def execute_command(self, command: str) -> str:
@@ -173,7 +321,7 @@ def execute_command(self, command: str) -> str:
         )
 ```
 
-## 5.  Agent 怎么拿到 sandbox？
+# Agent 怎么拿到 sandbox？
 入口在中间件: ```middlewares = [ThreadDataMiddleware(lazy_init=lazy_init),SandboxMiddleware(lazy_init=lazy_init),...]```; lazy_init=True，所以 before_agent() 不立刻创建 sandbox。
 
 真正创建时:
@@ -212,71 +360,131 @@ def ensure_sandbox_initialized(runtime):
   -> 直接复用 runtime.state 里的 sandbox_id
 ```
 
-## 6.bash 工具的完整运行链路
+# Host Bash 怎么限制路径
+在 LocalSandbox 下，bash 命令会先经过：
+```python
+validate_local_bash_command_paths(command, thread_data)
+```
 
-核心代码:
+原则是：
+```text
+命令里的用户数据路径必须用 /mnt/user-data/...
+不要直接写宿主机绝对路径
+```
+
+
+因为 shell 命令太灵活，比如环境变量、脚本内容、工具间接访问等，都可能绕过简单路径扫描。所以 LocalSandbox + Host Bash 只能用于“完全信任的本地环境”。
+
+
+# 命令实现
+
+ls、read_file、write_file、str_replace、bash 这些都是 LangChain 工具。它们的实现位置在 backend/sandbox/tools.py (line 989) 附近。
+可以先用一句话概括：这些工具是 LLM 能调用的 LangChain Tool；但真正读写文件/执行命令的是 sandbox 对象。工具负责参数入口、权限校验、路径转换、错误处理；sandbox 负责底层执行。
+
+## langchain工具
+
+例如：
 ```python
 @tool("bash", parse_docstring=True)
-def bash_tool(runtime, description: str, command: str) -> str:
-    sandbox = ensure_sandbox_initialized(runtime)
+def bash_tool(...)
 
-    if is_local_sandbox(runtime):
-        if not is_host_bash_allowed():
-            return "Error: Host bash execution is disabled..."
+@tool("ls", parse_docstring=True)
+def ls_tool(...)
 
-        ensure_thread_directories_exist(runtime)
+@tool("read_file", parse_docstring=True)
+def read_file_tool(...)
 
-        thread_data = get_thread_data(runtime)
-
-        validate_local_bash_command_paths(command, thread_data)
-
-        command = replace_virtual_paths_in_command(command, thread_data)
-
-        command = _apply_cwd_prefix(command, thread_data)
-
-        output = sandbox.execute_command(command)
-
-        return _truncate_bash_output(
-            mask_local_paths_in_output(output, thread_data),
-            max_chars,
-        )
-
-    return sandbox.execute_command(command)
 ```
 
-运行流程:
+## 这些工具怎么进入 agent 的工具列表
+
+它们不是硬编码直接塞进 agent，而是先写在 config.yaml 里：
+
+## 工具和 sandbox 的关系
+LangChain 工具不是直接打开文件。以 read_file 为例，它大概做这些事：
 ```
-1. 初始化/获取 sandbox
-2. 判断是不是 LocalSandbox
-3. 检查是否允许本机 bash
-4. 确保 workspace/uploads/outputs 目录存在
-5. 校验命令里的绝对路径是否合法
-6. 把 /mnt/user-data/... 替换成本机真实路径
-7. 在 workspace 目录下执行命令
-8. subprocess.run 执行
-9. 输出里的本机路径替换回 /mnt/user-data/...
-10. 截断过长输出
+1. 从 runtime 里拿当前 thread 的 state
+2. 确保 sandbox 已初始化
+3. 判断当前是不是 LocalSandbox
+4. 校验 path 是否允许访问
+5. 把虚拟路径解析成真实宿主机路径
+6. 调 sandbox.read_file(path)
+7. 对结果做截断/格式化/错误脱敏
+8. 返回字符串给 LLM
 ```
 
-## 7. 文件读写不是通过 bash，而是直接 Python 操作
+所以关系是：
+```
+LangChain Tool:
+  面向 LLM 的工具接口
 
+Sandbox:
+  面向系统的执行后端
+
+sandbox/tools.py:
+  两者之间的适配层
+```
+
+## 工具怎么拿到 sandbox
+
+核心函数在 tools.py (line 817)：
+
+```
+def ensure_sandbox_initialized(runtime) -> Sandbox:
+
+如果 runtime.state["sandbox"] 已经有 sandbox_id：
+  用 get_sandbox_provider().get(sandbox_id) 拿 sandbox
+
+否则：
+  从 runtime context/config 里拿 thread_id
+  provider.acquire(thread_id)
+  把 sandbox_id 写入 runtime.state["sandbox"]
+  provider.get(sandbox_id)
+
+每个工具都会实现
+sandbox = ensure_sandbox_initialized(runtime)
+```
+
+## read_file 怎么实现
+入口
 ```python
-read_file_tool:
+@tool("read_file", parse_docstring=True)
+def read_file_tool(runtime, description, path, start_line=None, end_line=None):
 
 sandbox = ensure_sandbox_initialized(runtime)
-validate_local_tool_path(path, thread_data, read_only=True)
-path = _resolve_and_validate_user_data_path(path, thread_data)
+
+if is_local_sandbox(runtime):
+    thread_data = get_thread_data(runtime)
+    validate_local_tool_path(path, thread_data, read_only=True)
+
+    if _is_skills_path(path):
+        path = _resolve_skills_path(path)
+    elif _is_acp_workspace_path(path):
+        path = _resolve_acp_workspace_path(path, thread_id)
+    elif not _is_custom_mount_path(path):
+        path = _resolve_and_validate_user_data_path(path, thread_data)
+
 content = sandbox.read_file(path)
-
-write_file_tool:
-
-sandbox = ensure_sandbox_initialized(runtime)
-validate_local_tool_path(path, thread_data)
-path = _resolve_and_validate_user_data_path(path, thread_data)
-
-with get_file_operation_lock(sandbox, path):
-    sandbox.write_file(path, content, append)
+return content
 ```
+关键几步：
+```
+validate_local_tool_path:  判断你有没有权限读这个虚拟路径
+_resolve_and_validate_user_data_path:  把 /mnt/user-data/... 转成真实 host 路径，并确认没有越界
+```
+
+最后真正读文件的是：
+```python
+sandbox.read_file(path)
+在 LocalSandbox 里：local_sandbox.py (line 279)
+def read_file(self, path):
+    resolved_path = self._resolve_path(path)
+    with open(resolved_path, encoding="utf-8") as f:
+        return f.read()
+```
+
+
+
 
 ```
 读文件/写文件不需要 shell
