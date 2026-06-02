@@ -108,4 +108,125 @@ hermes:
 为什么不用 LangChain？ 因为当你需要精细控制 prompt cache、跨 20 个 provider、子代理 fork、上下文压缩、记忆 nudge、后台回顾线程、文件系统检查点这些功能时，框架的抽象层会成为障碍，直接写 while 循环反而最简单。
 
 
+## agent 初始化
+
+## 阶段 0：CLI 启动，读取配置
+    
+
+    │
+    ├─ cli.py: HermesCLI.init()
+    │   ├─ 读取 ~/.hermes/config.yaml
+    │   ├─ 读取 ~/.hermes/.env → 加载 API keys
+    │   │
+    │   ├─ self.model = "deepseek-v4-pro"     ← config.yaml → model.default
+    │   ├─ self.provider = "deepseek"          ← config.yaml → model.provider
+    │   ├─ self.base_url = "https://api.deepseek.com"
+    │   │
+    │   ├─ self.enabled_toolsets = _get_platform_tools(config, "cli")
+    │   │   └─ 读取 config.yaml → platform_toolsets.cli = ["hermes-cli"]
+    │   │
+    │   └─ self.max_turns = agents.max_turns = 90
+
+## 阶段 1：创建 AIAgent 实例
+
+cli.py 第 4516 行:
+      │
+self.agent = AIAgent(
+    model="deepseek-v4-pro",
+    provider="deepseek",
+    base_url="https://api.deepseek.com",
+    api_key="sk-5157...",
+    enabled_toolsets=["hermes-cli"],    ← 从这里来
+    max_iterations=90,
+    platform="cli",
+    session_db=...,
+    ...约 40 个参数
+)
+│
+└─→ run_agent.py: AIAgent.init()
+    └─→ agent/agent_init.py: init_agent(self, ...)
+
+在 agent_init中会解析很多东西，然后绑定给agent
+
+## 阶段 2：解析 Provider + Credentials
+
+agent_init.py:
+    │
+    ├─ 解析 provider → "deepseek"
+    ├─ 解析 api_mode → "chat_completions"（OpenAI 兼容协议）
+    ├─ 建立 OpenAI client (api.deepseek.com)
+    ├─ 获取 model metadata（context length 等）
+    │
+    └─ agent.reasoning_config = {...}
+        agent.max_tokens = None
+        agent.prefill_messages = []
+
+## 阶段 3：加载工具 — Toolset 过滤 + Schema 生成
+
+agent_init.py 第 818 行:
+    │
+    agent.tools = get_tool_definitions(
+        enabled_toolsets=["hermes-cli"],
+        disabled_toolsets=[],
+    )
+    │
+    ├─ "hermes-cli" 是复合 toolset
+    │   └─ 展开 includes: ["web","browser","terminal","file",...]
+    │       └─ 进一步展开每个子 toolset
+    │           └─ 得到 ~70 个工具名
+    │
+    ├─ 对每个工具名:
+    │   ├─ registry.get_entry(name)
+    │   ├─ check_fn()? → 通过才加入  (如 browser 工具检查 API key)
+    │   ├─ dynamic_schema_overrides? → 更新描述（如 delegate_task 的并发数）
+    │   └─ 组装为 {"type":"function","function":{name,description,parameters}}
+    │
+    ├─ 过滤完后约 45 个工具 schema
+    │
+    └─ agent.tools = [45 个 OpenAI function-calling 格式 dict]
+        agent.valid_tool_names = {"read_file","write_file","terminal",...}
+    
+## 阶段 4：加载记忆 — MemoryStore 初始化
+
+
+## 阶段 7：首次构建系统提示词（延迟执行）
+
+系统提示词不在 init 时构建，而是延迟到 run_conversation() 首次调用时：
+conversation_loop.py 第 417 行:
+    │
+    if agent._cached_system_prompt is None:
+        _restore_or_build_system_prompt()
+        │
+        ├─ 检查 SQLite 是否有存储的 prompt?
+        │   └─ 新会话 → 没有 → 首次构建
+        │
+        └─ agent._build_system_prompt(system_message)
+            │
+            └─→ system_prompt.py: build_system_prompt()
+                    │
+                    ├─ STABLE 层:
+                    │   ├─ load_soul_md()  → /home/bai/.hermes/SOUL.md
+                    │   ├─ DEFAULT_AGENT_IDENTITY（如果没有 SOUL.md）
+                    │   ├─ MEMORY_GUIDANCE     ← 因为有 memory 工具
+                    │   ├─ SESSION_SEARCH_GUIDANCE
+                    │   ├─ SKILLS_GUIDANCE      ← 因为有 skill_manage 工具
+                    │   ├─ build_skills_system_prompt()
+                    │   │   └─ 扫描 ~/.hermes/skills/ → 生成技能索引
+                    │   ├─ build_environment_hints() → "WSL" 提示
+                    │   └─ PLATFORM_HINTS["cli"] → CLI 平台提示
+                    │
+                    ├─ CONTEXT 层:
+                    │   ├─ system_message（如果有）
+                    │   └─ build_context_files_prompt() → AGENTS.md
+                    │
+                    ├─ VOLATILE 层:
+                    │   ├─ MEMORY.md 冻结快照  [0/2200 chars]
+                    │   ├─ USER.md 冻结快照    [3%/1375 chars]
+                    │   ├─ 外部 provider block  （无）
+                    │   └─ "Conversation started: Monday, June 2, 2026"
+                    │       "Model: deepseek-v4-pro"
+                    │       "Provider: deepseek"
+                    │
+                    └─ 拼成大字符串 → agent._cached_system_prompt
+                        └─ 存入 SQLite 供后续恢复
 
