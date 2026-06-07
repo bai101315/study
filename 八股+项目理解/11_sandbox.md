@@ -24,6 +24,7 @@ bash
 grep
 glob
 ```
+
 调用工具的时候，才会检查路径是否合法：
 ```
 你要读哪里？
@@ -379,6 +380,7 @@ validate_local_bash_command_paths(command, thread_data)
 # 命令实现
 
 ls、read_file、write_file、str_replace、bash 这些都是 LangChain 工具。它们的实现位置在 backend/sandbox/tools.py (line 989) 附近。
+
 可以先用一句话概括：这些工具是 LLM 能调用的 LangChain Tool；但真正读写文件/执行命令的是 sandbox 对象。工具负责参数入口、权限校验、路径转换、错误处理；sandbox 负责底层执行。
 
 ## langchain工具

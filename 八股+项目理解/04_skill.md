@@ -34,7 +34,7 @@ SKILL.md 的内容分两部分。顶部是一段 YAML 格式的元数据，叫 f
 ## 1，Skill 的目录结构
 
 ## 2，解析SKILL
-parse_skill_file： 解析 SKILL.md 文件并提取元数据。如果解析成功，则返回***技能对象***；否则返回 None
+parse_skill_file： 解析 SKILL.md 文件并提取元数据。如果解析成功，则返回**技能对象**；否则返回 None
 
 允许字段：
 ```
