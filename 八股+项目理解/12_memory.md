@@ -145,7 +145,6 @@ facts每条大概是:
 ```
 
 ## 如何规范 LLM 输出标准 memory.json 格式？
-**LLM并不是输出完整memory.json**, 它输出的是“更新指令 JSON”，然后后端代码再把这个 JSON 应用到当前 memory 结构上。
 
 流程：
 ```text
