@@ -174,7 +174,6 @@ get_sandbox_provider()
   -> 创建 LocalSandboxProvider 单例
 ```
 
-
 ## 3.当前实现：LocalSandboxProvider
 
 做了两件事：

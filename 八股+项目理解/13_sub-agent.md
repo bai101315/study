@@ -193,6 +193,6 @@ result.cancel_event.set()
 if result.cancel_event.is_set():
     result.status = SubagentStatus.CANCELLED
     return result
-
 ```
+
 所以这是 协作式取消。如果子 agent 卡在某个长时间工具调用里，不一定能立刻停，要等下一次 stream chunk 边界。

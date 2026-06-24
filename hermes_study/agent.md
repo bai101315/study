@@ -1,6 +1,4 @@
-# Hermes Agent本质
-
-## 创建方式
+# 创建方式
 就是 AIAgent() ，一个普通 Python 类实例
 
 ```python
@@ -26,45 +24,178 @@ self.base_url = "https://api.deepseek.com"
 
 调用方式极其简单：```agent = AIAgent()```
 
-## 核心循环
+## 为什么要有60个参数？为什么直接传参
+
+AIAgent 覆盖的业务面太广了，简单说就是 一个类，多套前端。看调用方：
+
+调用方: CLI one-shot
+文件: hermes_cli/oneshot.py:313
+传的参数: 15个左右
+────────────────────────────────────────
+调用方: TUI gateway
+文件: tui_gateway/server.py:1906
+传的参数: ~20个
+────────────────────────────────────────
+调用方: 还有 Telegram gateway、Discord gateway、cron scheduler、batch runner、delegate_task...
+
+60个参数其实分为四组：
+```
+1. 模型/API 配置 (~12 个)：base_url, api_key, provider, api_mode, model, max_tokens, reasoning_config, service_tier, request_overrides, fallback_model, max_iterations, tool_delay
+
+2. 会话/平台身份 (~10 个)：session_id, platform, user_id, user_name, chat_id, chat_name, chat_type, thread_id, gateway_session_key, parent_session_id
+
+3. 回调函数 (~10 个)：tool_progress_callback, tool_start_callback, tool_complete_callback, thinking_callback, reasoning_callback, clarify_callback, step_callback, stream_delta_callback, interim_assistant_callback, tool_gen_callback, status_callback
+
+4. 开关/feature flag (~15 个)：quiet_mode, verbose_logging, save_trajectories, skip_context_files, skip_memory, load_soul_identity, checkpoints_enabled, checkpoint_max_snapshots, pass_session_id...
+```
+
+## 业内派系
+
+### 瘦构造函数 + Builder/Config（主流）
+LangChain、大多数 Java/.NET 框架走这条路：
+```python
+agent = AgentBuilder()
+    .with_model("gpt-4")
+    .with_tools([...])
+    .with_callbacks([...])
+    .build()
+```
+优点：渐进式构造，文档自解释，IDE 补全友好。每个 builder 方法接收的是"相关参数组"，不会一把 60 个参数糊脸上。
+缺点：多了一层抽象，builder 本身也要维护。而且 builder 暴露给用户的 API 往往比构造函数还大——只是组织方式不同。
+
+### Context 对象
+```python
+ctx = AgentContext(
+    model_config=...,
+    session_identity=...,
+    platform_hooks=...,
+)
+agent = Agent(ctx)
+```
+优点：参数数骤减到 1-2 个，传配置就像传一个背包；后续加字段不破坏签名。
+缺点：类型变得模糊，IDE 不知道 ctx 里到底有什么，需要运行时探索。
+
+### hermes-agent 现在的方式
+
+优点（确实有）：
+- 自文档——看签名就知道 agent 吃哪些东西，不需跳转另一个类
+- IDE 静态分析友好——pylance 精确提示每个参数名和类型
+- 没有中间对象——调用方直接传值，少一次堆分配
+- Python kwargs 天然兼容——TUI 那边用 **_agent_cbs(sid) 解包一把注入，零摩擦
+
+缺点（很痛）：
+- 60 个参数，新贡献者打开 AGENTS.md 就晕
+- 加一个新 feature flag（如 checkpoint_max_file_size_mb）就要在 AIAgent.init → init_agent → 内部的尾部链路都改一遍，容易漏
+- 很多参数在大多数调用方都是默认值（oneshot 模式不需要 clarify_callback，但它依然在签名里占位置）
+- 测试 Mock 痛苦——构造一个能用的 AIAgent 需要知道其全部 60 个参数的默认语义
+
+目前的问题还没有大到非改不可——因为所有调用方（CLI、TUI、gateway、batch）都有自己的一层函数封装（_build_agent() 之流），所以对业务代码来说，60 个参数的痛苦已经被隔离了，暴露的只有核心开发者。
+
+
+# init_agent
+```python
+class AIAgent:
+    def init(self, ...):
+        init_agent(self, ...)     # self 就是那个 Agent 实例
+                                    # 传进去之后在 init_agent 里叫 agent
+def init_agent(agent, ...):
+    agent.model = model           # 这里的 agent 就是外面的 self
+    agent.platform = platform     # 完全等价于 self.model = model
+    agent._interrupt_requested = False
+```
+这里面的agent就是self，这么做的理由：
+```
+1. 不想碰 init 的签名。AIAgent 有 60 个参数，如果把初始化逻辑抽成方法，方法的参数也会是 60 个——区别只是 def init(...) 变成 def _init_internals(self, ...)，视觉上没区别，拆不拆都难看。
+
+2. 物理文件拆分。把 1500 行初始化代码从 run_agent.py 搬到 agent/agent_init.py，run_agent.py 从 12000 行降到 ~4000 行，agent_init.py 独立成为一个 1504 行的文件。IDE 打开不卡了，git blame 有意义了，code review 不会被 diff 淹没。
+
+3. agent_init.py 可以被单独 import、单独测试。如果逻辑写在 AIAgent 内部作为方法，测试时你得构造一个完整的 AIAgent 实例或者 mock 它。现在 init_agent 是一个普通函数，测试可以直接传一个 mock 对象进去验属性。
+```
+
+
+# 核心循环
+
+只有两个入口```run_conversation```和```chat```, 
+```python
+def run_conversation(
+    self,
+    user_message: str,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+    from agent.conversation_loop import run_conversation
+    return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+
+def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    """
+    Simple chat interface that returns just the final response.
+
+    Args:
+        message (str): User message
+        stream_callback: Optional callback invoked with each text delta during streaming.
+
+    Returns:
+        str: Final assistant response
+    """
+    result = self.run_conversation(message, stream_callback=stream_callback)
+    return result["final_response"]
+```
+
 Hermes 使用的确实是 ReAct（Reasoning + Acting） 模式，但不是调任何库。核心循环在 conversation_loop.py，自己用 while 写的：
 
-```python
-agent/conversation_loop.py 第 598 行起
+    
+    run_conversation(user_message) 
+    │
+    ├─ L215-280  前置准备（stdio guard, session tag, skill origin, fallback 恢复）
+    ├─ L280-400  状态重置 & 内存水合（retry counter, budget, todo hydration, nudge 计数）
+    ├─ L400-525  构建 message list + preflight 上下文压缩
+    ├─ L526      主循环入口 ──────────────────────────────────────────────┐
+    │                                                                      │
+    │  ┌──── while (iteration < max AND budget > 0) or grace_call: ───┐   │
+    │  │                                                                │   │
+    │  │  L600-660   中断检查 / steer 注入 / step callback              │   │
+    │  │  L660-880   构建 API messages（system prompt + prefill + tools）│   │
+    │  │  L880-1050  KawaiiSpinner 启动                                 │   │
+    │  │  L936-1270  内层 retry 循环 ─── 实际 API 调用                  │   │
+    │  │             │  ├─ streaming / non-streaming 分支               │   │
+    │  │             │  ├─ 网络错误 → backoff + retry                   │   │
+    │  │             │  ├─ context 超长 → 压缩 → 清空 history → retry   │   │
+    │  │             │  ├─ rate limit → 等冷却 → retry                  │   │
+    │  │             │  └─ 成功 → 拿到 response                         │   │
+    │  │  L1270+    各种错误分支的 return（含 early exit）               │   │
+    │  │  L3105     工具调用处理                                         │   │
+    │  │             │  ├─ 校验 tool name（防幻觉）                      │   │
+    │  │             │  ├─ 校验 JSON 参数                               │   │
+    │  │             │  ├─ 执行 handle_function_call()                  │   │
+    │  │             │  └─ 结果塞回 messages                            │   │
+    │  │  L3360     上下文压缩检查（should_compress）                    │   │
+    │  │  L3412     增量保存 session log                                 │   │
+    │  │  L3520     跑回 while 顶部，下一轮迭代                          │   │
+    │  └────────────────────────────────────────────────────────────────┘   │
+    │                                                                      │
+    ├─ L3858  保存 trajectory（如启用）                                     │
+    ├─ L3940  Plugin hook: transform_llm_output                             │
+    ├─ L3960  Plugin hook: post_llm_call                                    │
+    ├─ L3990  提取 final_response                                           │
+    ├─ L4060  后台 review nudge（memory/skill 自动保存提示）                 │
+    ├─ L4079  Plugin hook: on_session_end                                   │
+    └─ L4095  return result
 
-api_call_count = 0
-
-while (api_call_count < agent.max_iterations      # ← 最多 90 轮
-        and agent.iteration_budget.remaining > 0) \
-        or agent._budget_grace_call:
-
-    api_call_count += 1
-
-    # ─── Step 1: 构建 API kwargs，含 messages + tools ───
-    api_kwargs = agent._build_api_kwargs(api_messages)
-    # api_kwargs = {
-    #     "model": "deepseek-v4-pro",
-    #     "messages": [...],     # 完整对话历史
-    #     "tools": agent.tools,  # 过滤后的 tool schemas
-    # }
-
-    # ─── Step 2: 调用 LLM ─── 
-    response = client.chat.completions.create(**api_kwargs)
-
-    # ─── Step 3: 解析响应 ─── 
-    msg = response.choices[0].message
-
-    if msg.tool_calls:
-        # ─── Step 4a: 有工具调用 → 执行 → 结果追加到 messages → 继续循环
-        for tc in msg.tool_calls:
-            tool_result = handle_function_call(tc.function.name, tc.function.args)
-            messages.append({"role": "tool", "content": tool_result, ...})
-        # → 回到 while 顶部，下一轮 LLM 会看到工具结果
-    else:
-        # ─── Step 4b: 纯文本响应 → 结束
-        final_response = msg.content
-        break
+理解需求：
 ```
+1. 想理解正常流程（一个 tool call 怎么走完）→ 从 L598 的 while 开始，跳到 L3105 的 tool call 处理，然后跟回循环顶部
+2. 想理解错误处理（context 超长怎么办）→ 从 L2300 的 compression_attempts 开始往下看
+3. 想加新 feature → 搞清楚你的 feature 插在流水线的哪个阶段（前置准备？主循环内？post-turn？），只看那个区块
+4. 想看 API 调用细节 → L936-L1270 的 retry 循环
+```
+
+说实话，4000 行函数在 Python 圈是异类，但在"一个主循环驱动所有事情"的游戏引擎里（Unity 的 Update(), Unreal 的 Tick()）并不罕见。hermes-agent 的 run_conversation 本质就是一个单帧 tick——只是这个帧可能要跑 90 次迭代。
+
+
 
 ## 和create_agent()区别
 

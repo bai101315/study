@@ -1,5 +1,5 @@
-
 # 面试版本
+
 ```
 “我的项目里有两套持久化机制。Checkpoint 是 LangGraph 的运行状态持久化，用 SQLite 保存每个 thread_id 的状态快照，包括 messages、tool calls、tool results、todos、title 等，它解决的是多轮对话恢复和进程重启后的续聊问题。
 Memory 是长期语义记忆，用 memory.json 保存用户画像、历史摘要和高置信事实，它不是原始聊天记录，而是通过 MemoryMiddleware 在 agent 执行结束后过滤对话，再进入 debounce 队列，最后由 LLM 根据当前 memory 和新对话生成 JSON 更新指令，应用后原子写入文件。下一次创建 agent 时，系统会把 memory 格式化后注入 system prompt，从而实现个性化和长期上下文。”
